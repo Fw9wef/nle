@@ -22,9 +22,11 @@ import threading
 import time
 import timeit
 import traceback
+from collections import deque
 
 # Necessary for multithreading.
 os.environ["OMP_NUM_THREADS"] = "1"
+H_DIM = 512
 
 try:
     import torch
@@ -73,6 +75,14 @@ parser.add_argument("--disable_cuda", action="store_true",
                     help="Disable CUDA.")
 parser.add_argument("--use_lstm", action="store_true",
                     help="Use LSTM in agent model.")
+parser.add_argument("--tf_layers", default=1, type=int,
+                    help='number of transformer layers')
+parser.add_argument("--tf_nheads", default=2, type=int,
+                    help='number of attention heads')
+parser.add_argument("--dim_feedforward", default=512, type=int,
+                    help="transformer feedforward dim")
+parser.add_argument("--tf_maxlen", default=0, type=int,
+                    help="max processing seq len")
 
 # Loss settings.
 parser.add_argument("--entropy_cost", default=0.0006,
@@ -105,6 +115,16 @@ logging.basicConfig(
     ),
     level=logging.INFO,
 )
+
+
+def get_tf_params(flags):
+    params = {
+        'nhead': flags.tf_nheads,
+        'dim_feedforward': flags.dim_feedforward,
+        'num_encoder_layers': flags.tf_layers,
+        'maxlen': flags.tf_maxlen
+    }
+    return params
 
 
 def nested_map(f, n):
@@ -152,12 +172,13 @@ def act(
 ):
     try:
         logging.info("Actor %i started.", actor_index)
-
         gym_env = create_env(flags.env, savedir=flags.rundir)
         env = ResettingEnvironment(gym_env)
         env_output = env.initial()
         agent_state = model.initial_state(batch_size=1)
         agent_output, unused_state = model(env_output, agent_state)
+        agent_state_buffer = StateBuffer(agent_state)
+
         while True:
             index = free_queue.get()
             if index is None:
@@ -168,15 +189,17 @@ def act(
                 buffers[key][index][0, ...] = env_output[key]
             for key in agent_output:
                 buffers[key][index][0, ...] = agent_output[key]
-            for i, tensor in enumerate(agent_state):
-                initial_agent_state_buffers[index][i][...] = tensor
+            agent_state_buffer.cleening()
+            for i, state in enumerate(agent_state_buffer.get_all()):
+                initial_agent_state_buffers[index][i].put(state)
 
             # Do new rollout.
             for t in range(flags.unroll_length):
                 with torch.no_grad():
-                    agent_output, agent_state = model(env_output, agent_state)
+                    agent_output, agent_state = model(env_output, agent_state_buffer.get_last())
 
                 env_output = env.step(agent_output["action"])
+                agent_state_buffer.append(agent_state)
 
                 for key in env_output:
                     buffers[key][index][t + 1, ...] = env_output[key]
@@ -207,10 +230,10 @@ def get_batch(
     batch = {
         key: torch.stack([buffers[key][m] for m in indices], dim=1) for key in buffers
     }
-    initial_agent_state = (
-        torch.cat(ts, dim=1)
-        for ts in zip(*[initial_agent_state_buffers[m] for m in indices])
-    )
+    initial_agent_st = [initial_agent_state_buffers[m][0].get() for m in indices]
+    initial_agent_done = [initial_agent_state_buffers[m][1].get() for m in indices]
+    initial_agent_state = collate_fn(initial_agent_st, initial_agent_done)
+
     for m in indices:
         free_queue.put(m)
     batch = {k: t.to(device=flags.device, non_blocking=True) for k, t in batch.items()}
@@ -293,6 +316,18 @@ def learn(
         return stats
 
 
+def collate_fn(initial_agent_st, initial_agent_done):
+    maxT = max(done.shape[0] for done in initial_agent_done)
+    pad_done = torch.zeros((1, 1), dtype=torch.uint8)
+    pad_st = torch.zeros((1, 1, H_DIM))
+
+    for i, (st, done) in enumerate(zip(initial_agent_st, initial_agent_done)):
+        initial_agent_done[i] = torch.cat([pad_done.tile(maxT-done.shape[0], 1), done], dim=0)
+        initial_agent_st[i] = torch.cat([pad_st.tile(maxT-st.shape[0], 1, 1), st], dim=0)
+
+    return torch.cat(initial_agent_st, dim=1), torch.cat(initial_agent_done, dim=1)
+
+
 def create_buffers(flags, observation_space, num_actions, num_overlapping_steps=1):
     size = (flags.unroll_length + num_overlapping_steps,)
 
@@ -328,6 +363,40 @@ def _format_observations(observation, keys=("glyphs", "blstats")):
         entry = entry.view((1, 1) + entry.shape)  # (...) -> (T,B,...).
         observations[key] = entry
     return observations
+
+
+class StateBuffer:
+    def __init__(self, init_state):
+        self.last = 0
+        self.st_buffer = deque()
+        self.done_buffer = deque()
+        self.init_state = init_state
+
+    def get_all(self):
+        if len(self.done_buffer):
+            return torch.cat([*self.st_buffer]), torch.cat([*self.done_buffer])
+        else:
+            return self.init_state
+
+    def get_last(self):
+        if len(self.done_buffer):
+            return torch.cat([*self.st_buffer][self.last:]), torch.cat([*self.done_buffer][self.last:])
+        else:
+            return self.init_state
+
+    def append(self, agent_state):
+        st_tensor, done_tensor = agent_state
+        if done_tensor:
+            self.last = len(self.done_buffer)
+        self.st_buffer.append(st_tensor)
+        self.done_buffer.append(done_tensor)
+
+    def cleening(self):
+        for _ in range(self.last):
+            self.st_buffer.popleft()
+            self.done_buffer.popleft()
+        self.last = 0
+
 
 
 class ResettingEnvironment:
@@ -434,24 +503,22 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     action_space = env.action_space
     del env  # End this before forking.
 
-    model = Net(observation_space, action_space.n, flags.use_lstm)
+    tf_params = get_tf_params(flags)
+    model = Net(observation_space, action_space.n, flags.use_lstm, tf_params=tf_params)
     buffers = create_buffers(flags, observation_space, model.num_actions)
 
     model.share_memory()
 
-    # Add initial RNN state.
-    initial_agent_state_buffers = []
-    for _ in range(flags.num_buffers):
-        state = model.initial_state(batch_size=1)
-        for t in state:
-            t.share_memory_()
-        initial_agent_state_buffers.append(state)
-
-    actor_processes = []
     ctx = mp.get_context("fork")
     free_queue = ctx.SimpleQueue()
     full_queue = ctx.SimpleQueue()
 
+    # Add initial RNN state.
+    initial_agent_state_buffers = []
+    for _ in range(flags.num_buffers):
+        initial_agent_state_buffers.append((ctx.SimpleQueue(), ctx.SimpleQueue()))
+
+    actor_processes = []
     for i in range(flags.num_actors):
         actor = ctx.Process(
             target=act,
@@ -469,7 +536,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
         actor.start()
         actor_processes.append(actor)
 
-    learner_model = Net(observation_space, action_space.n, flags.use_lstm).to(
+    learner_model = Net(observation_space, action_space.n, flags.use_lstm, tf_params=tf_params).to(
         device=flags.device
     )
     learner_model.load_state_dict(model.state_dict())
@@ -593,7 +660,8 @@ def test(flags, num_episodes=10):
 
     gym_env = create_env(flags.env)
     env = ResettingEnvironment(gym_env)
-    model = Net(gym_env.observation_space, gym_env.action_space.n, flags.use_lstm)
+    tf_params = get_tf_params(flags)
+    model = Net(gym_env.observation_space, gym_env.action_space.n, flags.use_lstm, tf_params=tf_params)
     model.eval()
     checkpoint = torch.load(checkpointpath, map_location="cpu")
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -602,14 +670,17 @@ def test(flags, num_episodes=10):
     returns = []
 
     agent_state = model.initial_state(batch_size=1)
+    agent_state_buffer = StateBuffer(agent_state)
 
     while len(returns) < num_episodes:
         if flags.mode == "test_render":
             env.gym_env.render()
-        policy_outputs, agent_state = model(observation, agent_state)
+        policy_outputs, agent_state = model(observation, agent_state_buffer.get_last())
+        agent_state_buffer.append(agent_state)
         observation = env.step(policy_outputs["action"])
         if observation["done"].item():
             returns.append(observation["episode_return"].item())
+            agent_state_buffer.cleening()
             logging.info(
                 "Episode ended after %d steps. Return: %.1f",
                 observation["episode_step"].item(),
@@ -711,6 +782,96 @@ class Crop(nn.Module):
         )
 
 
+class PositionalEncoder(nn.Module):
+    def __init__(self, d_model, maxlen):
+        super().__init__()
+        self.d_model = d_model
+        self.maxlen = maxlen
+
+    def calc_pos(self, done_vector):
+        done_vector[-1] = True
+        pe = list()
+        for done in done_vector.transpose(0, 1):
+            cuts = torch.where(done)[0]
+            cuts[1:] = cuts[1:] - cuts[:-1]
+            cuts[-1] += 1
+
+            pos_enc = list()
+            for cut in cuts:
+                cut_mtx = list()
+                for i in range(0, self.d_model, 2):
+                    cut_mtx.append(torch.sin(torch.arange(cut, dtype=torch.float32) / (10000 ** ((2 * i) / self.d_model))))
+                    cut_mtx.append(torch.cos(torch.arange(cut, dtype=torch.float32) / (10000 ** ((2 * (i + 1)) / self.d_model))))
+                pos_enc.append(torch.stack(cut_mtx, dim=1))
+            pos_enc = torch.cat(pos_enc, dim=0)
+            pe.append(pos_enc)
+
+        pe = torch.stack(pe, dim=1)
+        if self.maxlen:
+            pe = pe[-self.maxlen:]
+        return pe
+
+    def forward(self, x, done_vector):
+        pe = self.calc_pos(done_vector)
+        x = x[-self.maxlen:] + pe.to(x.device)
+        return x
+
+
+class BaseEncoderLayer(nn.TransformerEncoderLayer):
+    def forward(self, src, src_mask=None, src_key_padding_mask=None) -> torch.Tensor:
+
+        src2 = list()
+        for batch_n in range(src.shape[1]):
+            s = src[:, batch_n:batch_n+1]
+            s_mask = src_mask[batch_n]
+            s2 = self.self_attn(s, s, s, attn_mask=s_mask)[0]
+            src2.append(s2)
+        src2 = torch.cat(src2, dim=1)
+        src = src + self.dropout1(src2)
+        src = self.norm1(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
+        src = src + self.dropout2(src2)
+        src = self.norm2(src)
+        return src
+
+
+class TransformerEncoder(nn.Module):
+    def __init__(self, d_model=512, nhead=2, dim_feedforward=512, num_encoder_layers=1, maxlen=0):
+        super(TransformerEncoder, self).__init__()
+        self.maxlen = maxlen
+        self.pos_enc = PositionalEncoder(d_model=d_model, maxlen=maxlen)
+        self.net = nn.Transformer(custom_encoder=BaseEncoderLayer(d_model, nhead, dim_feedforward),
+                                  custom_decoder=nn.Identity(),
+                                  d_model=d_model, nhead=nhead,
+                                  dim_feedforward=dim_feedforward,
+                                  num_encoder_layers=num_encoder_layers)
+
+    def forward(self, inp, done_vector):
+        mask = self.get_mask(done_vector).to(inp.device)
+        inp = self.pos_enc(inp, done_vector)
+        out = self.net.encoder(inp, src_mask=mask)
+        return out
+
+    def get_mask(self, done_vector):
+        vec_l, batch_size = done_vector.shape
+        mask = torch.full((batch_size, vec_l, vec_l), float("-inf"), dtype=torch.float32)
+
+        done_vector[-1] = True
+        for bn, done in enumerate(done_vector.transpose(0,1)):
+            cuts = torch.where(done)[0]
+            cuts[1:] = cuts[1:] - cuts[:-1]
+            cuts[-1] += 1
+
+            curr_ind = 0
+            for cut in cuts:
+                partial_mask = self.net.generate_square_subsequent_mask(cut)
+                mask[bn, curr_ind:curr_ind+cut, curr_ind:curr_ind+cut] = partial_mask
+                curr_ind += cut
+        if self.maxlen:
+            mask = mask[:, -self.maxlen:, -self.maxlen:]
+        return mask
+
+
 class NetHackNet(nn.Module):
     def __init__(
         self,
@@ -720,6 +881,7 @@ class NetHackNet(nn.Module):
         embedding_dim=32,
         crop_dim=9,
         num_layers=5,
+        tf_params=None
     ):
         super(NetHackNet, self).__init__()
 
@@ -808,7 +970,16 @@ class NetHackNet(nn.Module):
         )
 
         if self.use_lstm:
-            self.core = nn.LSTM(self.h_dim, self.h_dim, num_layers=1)
+            params = {
+                'd_model': 512,
+                'nhead': 2,
+                'dim_feedforward': 512,
+                'num_encoder_layers': 1,
+                'maxlen': 0
+            }
+            if tf_params:
+                params.update(tf_params)
+            self.core = TransformerEncoder(**params)
 
         self.policy = nn.Linear(self.h_dim, self.num_actions)
         self.baseline = nn.Linear(self.h_dim, 1)
@@ -816,10 +987,7 @@ class NetHackNet(nn.Module):
     def initial_state(self, batch_size=1):
         if not self.use_lstm:
             return tuple()
-        return tuple(
-            torch.zeros(self.core.num_layers, batch_size, self.core.hidden_size)
-            for _ in range(2)
-        )
+        return torch.zeros(0, batch_size, H_DIM), torch.zeros(0, batch_size)
 
     def _select(self, embed, x):
         # Work around slow backward pass of nn.Embedding, see
@@ -901,18 +1069,14 @@ class NetHackNet(nn.Module):
         st = self.fc(st)
 
         if self.use_lstm:
+            prev_st, prev_done = core_state
             core_input = st.view(T, B, -1)
-            core_output_list = []
-            notdone = (~env_outputs["done"]).float()
-            for input, nd in zip(core_input.unbind(), notdone.unbind()):
-                # Reset core state to zero whenever an episode ended.
-                # Make `done` broadcastable with (num_layers, B, hidden_size)
-                # states:
-                nd = nd.view(1, -1, 1)
-                core_state = tuple(nd * s for s in core_state)
-                output, core_state = self.core(input.unsqueeze(0), core_state)
-                core_output_list.append(output)
-            core_output = torch.flatten(torch.cat(core_output_list), 0, 1)
+            core_input = torch.cat([prev_st, core_input], dim=0)
+
+            done = (env_outputs["done"]).float()
+            done = torch.cat([prev_done, done], dim=0)
+
+            core_output = (self.core(core_input, done)[-T:]).view(T*B, -1)
         else:
             core_output = st
 
@@ -933,7 +1097,7 @@ class NetHackNet(nn.Module):
 
         return (
             dict(policy_logits=policy_logits, baseline=baseline, action=action),
-            core_state,
+            (st.view(T, B, -1), (env_outputs["done"]).float()),
         )
 
 
