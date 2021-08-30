@@ -12,7 +12,7 @@
 последовательности обрабатываются без ограничения по длине
 
 ###Пример запуска: </br>
-`python agent.py --num_actors 80 --batch_size 32
+`python agent.py --use_lstm --num_actors 80 --batch_size 32
 --unroll_length 80 --learning_rate 0.0001
 --entropy_cost 0.0001  --total_steps 1000000000
 --savedir ./test/ --tf_layers 2 --tf_nheads 4
