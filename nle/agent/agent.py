@@ -985,8 +985,6 @@ class NetHackNet(nn.Module):
         self.baseline = nn.Linear(self.h_dim, 1)
 
     def initial_state(self, batch_size=1):
-        if not self.use_lstm:
-            return tuple()
         return torch.zeros(0, batch_size, H_DIM), torch.zeros(0, batch_size)
 
     def _select(self, embed, x):
