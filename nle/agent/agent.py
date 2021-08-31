@@ -26,7 +26,7 @@ from collections import deque
 
 # Necessary for multithreading.
 os.environ["OMP_NUM_THREADS"] = "1"
-H_DIM = 512
+H_DIM = 32
 
 try:
     import torch
@@ -92,7 +92,7 @@ parser.add_argument("--baseline_cost", default=0.5,
 parser.add_argument("--discounting", default=0.99,
                     type=float, help="Discounting factor.")
 parser.add_argument("--reward_clipping", default="abs_one",
-                    choices=["abs_one", "none"],
+                    choices=["abs_one", "none", "tanh"],
                     help="Reward clipping.")
 
 # Optimizer settings.
@@ -177,7 +177,7 @@ def act(
         env_output = env.initial()
         agent_state = model.initial_state(batch_size=1)
         agent_output, unused_state = model(env_output, agent_state)
-        agent_state_buffer = StateBuffer(agent_state)
+        agent_state_buffer = StateBuffer(flags.tf_maxlen-flags.unroll_length)
 
         while True:
             index = free_queue.get()
@@ -189,14 +189,14 @@ def act(
                 buffers[key][index][0, ...] = env_output[key]
             for key in agent_output:
                 buffers[key][index][0, ...] = agent_output[key]
-            agent_state_buffer.cleening()
+            #agent_state_buffer.cleening()
             for i, state in enumerate(agent_state_buffer.get_all()):
                 initial_agent_state_buffers[index][i].put(state)
 
             # Do new rollout.
             for t in range(flags.unroll_length):
                 with torch.no_grad():
-                    agent_output, agent_state = model(env_output, agent_state_buffer.get_last())
+                    agent_output, agent_state = model(env_output, agent_state_buffer.get_all())
 
                 env_output = env.step(agent_output["action"])
                 agent_state_buffer.append(agent_state)
@@ -230,9 +230,11 @@ def get_batch(
     batch = {
         key: torch.stack([buffers[key][m] for m in indices], dim=1) for key in buffers
     }
-    initial_agent_st = [initial_agent_state_buffers[m][0].get() for m in indices]
-    initial_agent_done = [initial_agent_state_buffers[m][1].get() for m in indices]
-    initial_agent_state = collate_fn(initial_agent_st, initial_agent_done)
+    initial_agent_st = torch.cat([initial_agent_state_buffers[m][0].get() for m in indices], dim=1)
+    initial_agent_done = torch.cat([initial_agent_state_buffers[m][1].get() for m in indices], dim=1)
+    initial_agent_ind = torch.cat([initial_agent_state_buffers[m][2].get() for m in indices], dim=0)
+    # initial_agent_state = collate_fn(initial_agent_st, initial_agent_done)
+    initial_agent_state = (initial_agent_st, initial_agent_done, initial_agent_ind)
 
     for m in indices:
         free_queue.put(m)
@@ -267,6 +269,8 @@ def learn(
         rewards = batch["reward"]
         if flags.reward_clipping == "abs_one":
             clipped_rewards = torch.clamp(rewards, -1, 1)
+        elif flags.reward_clipping == "tanh":
+            clipped_rewards = torch.tanh(rewards/100)
         elif flags.reward_clipping == "none":
             clipped_rewards = rewards
 
@@ -366,37 +370,23 @@ def _format_observations(observation, keys=("glyphs", "blstats")):
 
 
 class StateBuffer:
-    def __init__(self, init_state):
-        self.last = 0
-        self.st_buffer = deque()
-        self.done_buffer = deque()
-        self.init_state = init_state
+    def __init__(self, maxlen):
+        self.curr_beg_ind = torch.zeros(1, dtype=torch.int32)
+        self.maxlen = maxlen
+        self.st_buffer = deque([torch.zeros((1, 1, H_DIM), dtype=torch.uint8) for _ in range(maxlen)], maxlen=maxlen)
+        self.done_buffer = deque([torch.ones((1, 1)) for _ in range(maxlen)], maxlen=maxlen)
 
     def get_all(self):
-        if len(self.done_buffer):
-            return torch.cat([*self.st_buffer]), torch.cat([*self.done_buffer])
-        else:
-            return self.init_state
-
-    def get_last(self):
-        if len(self.done_buffer):
-            return torch.cat([*self.st_buffer][self.last:]), torch.cat([*self.done_buffer][self.last:])
-        else:
-            return self.init_state
+        return torch.cat([*self.st_buffer]), torch.cat([*self.done_buffer]), self.curr_beg_ind
 
     def append(self, agent_state):
         st_tensor, done_tensor = agent_state
-        if done_tensor:
-            self.last = len(self.done_buffer)
+        if self.done_buffer[0]:
+            self.curr_beg_ind[:] = 1
+        else:
+            self.curr_beg_ind += 1
         self.st_buffer.append(st_tensor)
         self.done_buffer.append(done_tensor)
-
-    def cleening(self):
-        for _ in range(self.last):
-            self.st_buffer.popleft()
-            self.done_buffer.popleft()
-        self.last = 0
-
 
 
 class ResettingEnvironment:
@@ -516,7 +506,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
     # Add initial RNN state.
     initial_agent_state_buffers = []
     for _ in range(flags.num_buffers):
-        initial_agent_state_buffers.append((ctx.SimpleQueue(), ctx.SimpleQueue()))
+        initial_agent_state_buffers.append((ctx.SimpleQueue(), ctx.SimpleQueue(), ctx.SimpleQueue()))
 
     actor_processes = []
     for i in range(flags.num_actors):
@@ -788,20 +778,23 @@ class PositionalEncoder(nn.Module):
         self.d_model = d_model
         self.maxlen = maxlen
 
-    def calc_pos(self, done_vector):
+    def calc_pos(self, done_vector, beg_ind):
         done_vector[-1] = True
         pe = list()
-        for done in done_vector.transpose(0, 1):
+        for done, beg in zip(done_vector.transpose(0, 1), beg_ind):
             cuts = torch.where(done)[0]
             cuts[1:] = cuts[1:] - cuts[:-1]
             cuts[-1] += 1
 
+            start_inds = torch.zeros_like(cuts, dtype=torch.int32)
+            start_inds[0] = beg
+
             pos_enc = list()
-            for cut in cuts:
+            for cut, start in zip(cuts, start_inds):
                 cut_mtx = list()
                 for i in range(0, self.d_model, 2):
-                    cut_mtx.append(torch.sin(torch.arange(cut, dtype=torch.float32) / (10000 ** ((2 * i) / self.d_model))))
-                    cut_mtx.append(torch.cos(torch.arange(cut, dtype=torch.float32) / (10000 ** ((2 * (i + 1)) / self.d_model))))
+                    cut_mtx.append(torch.sin(torch.arange(start, cut+start, dtype=torch.float32) / (10000 ** ((2 * i) / self.d_model))))
+                    cut_mtx.append(torch.cos(torch.arange(start, cut+start, dtype=torch.float32) / (10000 ** ((2 * (i + 1)) / self.d_model))))
                 pos_enc.append(torch.stack(cut_mtx, dim=1))
             pos_enc = torch.cat(pos_enc, dim=0)
             pe.append(pos_enc)
@@ -811,8 +804,8 @@ class PositionalEncoder(nn.Module):
             pe = pe[-self.maxlen:]
         return pe
 
-    def forward(self, x, done_vector):
-        pe = self.calc_pos(done_vector)
+    def forward(self, x, done_vector, beg_ind):
+        pe = self.calc_pos(done_vector, beg_ind)
         x = x[-self.maxlen:] + pe.to(x.device)
         return x
 
@@ -846,9 +839,9 @@ class TransformerEncoder(nn.Module):
                                   dim_feedforward=dim_feedforward,
                                   num_encoder_layers=num_encoder_layers)
 
-    def forward(self, inp, done_vector):
+    def forward(self, inp, done_vector, beg_ind):
         mask = self.get_mask(done_vector).to(inp.device)
-        inp = self.pos_enc(inp, done_vector)
+        inp = self.pos_enc(inp, done_vector, beg_ind)
         out = self.net.encoder(inp, src_mask=mask)
         return out
 
@@ -895,7 +888,7 @@ class NetHackNet(nn.Module):
         self.W = self.glyph_shape[1]
 
         self.k_dim = embedding_dim
-        self.h_dim = 512
+        self.h_dim = H_DIM
 
         self.crop_dim = crop_dim
 
@@ -971,7 +964,7 @@ class NetHackNet(nn.Module):
 
         if self.use_lstm:
             params = {
-                'd_model': 512,
+                'd_model': H_DIM,
                 'nhead': 2,
                 'dim_feedforward': 512,
                 'num_encoder_layers': 1,
@@ -985,7 +978,7 @@ class NetHackNet(nn.Module):
         self.baseline = nn.Linear(self.h_dim, 1)
 
     def initial_state(self, batch_size=1):
-        return torch.zeros(0, batch_size, H_DIM), torch.zeros(0, batch_size)
+        return torch.zeros(0, batch_size, H_DIM), torch.zeros(0, batch_size), torch.zeros(batch_size)
 
     def _select(self, embed, x):
         # Work around slow backward pass of nn.Embedding, see
@@ -1067,14 +1060,14 @@ class NetHackNet(nn.Module):
         st = self.fc(st)
 
         if self.use_lstm:
-            prev_st, prev_done = core_state
+            prev_st, prev_done, beg_ind = core_state
             core_input = st.view(T, B, -1)
             core_input = torch.cat([prev_st, core_input], dim=0)
 
             done = (env_outputs["done"]).float()
             done = torch.cat([prev_done, done], dim=0)
 
-            core_output = (self.core(core_input, done)[-T:]).view(T*B, -1)
+            core_output = (self.core(core_input, done, beg_ind)[-T:]).view(T*B, -1)
         else:
             core_output = st
 
