@@ -806,7 +806,8 @@ class PositionalEncoder(nn.Module):
 
     def forward(self, x, done_vector, beg_ind):
         pe = self.calc_pos(done_vector, beg_ind)
-        x = x[-self.maxlen:] + pe.to(x.device)
+        x = torch.cat([x[-self.maxlen:], pe.to(x.device)], dim=-1)
+        #x = x[-self.maxlen:] + pe.to(x.device)
         return x
 
 
@@ -832,11 +833,11 @@ class TransformerEncoder(nn.Module):
     def __init__(self, d_model=512, nhead=2, dim_feedforward=512, num_encoder_layers=1, maxlen=0):
         super(TransformerEncoder, self).__init__()
         self.maxlen = maxlen
-        self.pos_enc = PositionalEncoder(d_model=d_model, maxlen=maxlen)
-        self.net = nn.Transformer(custom_encoder=BaseEncoderLayer(d_model, nhead, dim_feedforward),
+        self.pos_enc = PositionalEncoder(d_model=10, maxlen=maxlen)
+        self.net = nn.Transformer(custom_encoder=BaseEncoderLayer(d_model+10, nhead, d_model+10),
                                   custom_decoder=nn.Identity(),
-                                  d_model=d_model, nhead=nhead,
-                                  dim_feedforward=dim_feedforward,
+                                  d_model=d_model+10, nhead=nhead,
+                                  dim_feedforward=d_model+10,
                                   num_encoder_layers=num_encoder_layers)
 
     def forward(self, inp, done_vector, beg_ind):
@@ -974,8 +975,8 @@ class NetHackNet(nn.Module):
                 params.update(tf_params)
             self.core = TransformerEncoder(**params)
 
-        self.policy = nn.Linear(self.h_dim, self.num_actions)
-        self.baseline = nn.Linear(self.h_dim, 1)
+        self.policy = nn.Linear(self.h_dim*2, self.num_actions)
+        self.baseline = nn.Linear(self.h_dim*2, 1)
 
     def initial_state(self, batch_size=1):
         return torch.zeros(0, batch_size, H_DIM), torch.zeros(0, batch_size), torch.zeros(batch_size)
