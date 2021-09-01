@@ -59,9 +59,9 @@ parser.add_argument("--disable_checkpoint", action="store_true",
                     help="Disable saving checkpoint.")
 parser.add_argument("--savedir", default="~/torchbeast/",
                     help="Root dir where experiment data will be saved.")
-parser.add_argument("--num_actors", default=4, type=int, metavar="N",
+parser.add_argument("--num_actors", default=16, type=int, metavar="N",
                     help="Number of actors (default: 4).")
-parser.add_argument("--total_steps", default=100000, type=int, metavar="T",
+parser.add_argument("--total_steps", default=1000000000, type=int, metavar="T",
                     help="Total environment steps to train for.")
 parser.add_argument("--batch_size", default=8, type=int, metavar="B",
                     help="Learner batch size.")
@@ -81,28 +81,28 @@ parser.add_argument("--tf_nheads", default=2, type=int,
                     help='number of attention heads')
 parser.add_argument("--dim_feedforward", default=512, type=int,
                     help="transformer feedforward dim")
-parser.add_argument("--tf_maxlen", default=0, type=int,
+parser.add_argument("--tf_maxlen", default=180, type=int,
                     help="max processing seq len")
 
 # Loss settings.
-parser.add_argument("--entropy_cost", default=0.0006,
+parser.add_argument("--entropy_cost", default=0.0001,
                     type=float, help="Entropy cost/multiplier.")
 parser.add_argument("--baseline_cost", default=0.5,
                     type=float, help="Baseline cost/multiplier.")
 parser.add_argument("--discounting", default=0.99,
                     type=float, help="Discounting factor.")
-parser.add_argument("--reward_clipping", default="abs_one",
+parser.add_argument("--reward_clipping", default="tanh",
                     choices=["abs_one", "none", "tanh"],
                     help="Reward clipping.")
 
 # Optimizer settings.
-parser.add_argument("--learning_rate", default=0.00048,
+parser.add_argument("--learning_rate", default=0.0002,
                     type=float, metavar="LR", help="Learning rate.")
 parser.add_argument("--alpha", default=0.99, type=float,
                     help="RMSProp smoothing constant.")
 parser.add_argument("--momentum", default=0, type=float,
                     help="RMSProp momentum.")
-parser.add_argument("--epsilon", default=0.01, type=float,
+parser.add_argument("--epsilon", default=0.000001, type=float,
                     help="RMSProp epsilon.")
 parser.add_argument("--grad_norm_clipping", default=40.0, type=float,
                     help="Global gradient norm clip.")
@@ -122,7 +122,8 @@ def get_tf_params(flags):
         'nhead': flags.tf_nheads,
         'dim_feedforward': flags.dim_feedforward,
         'num_encoder_layers': flags.tf_layers,
-        'maxlen': flags.tf_maxlen
+        'maxlen': flags.tf_maxlen,
+        'maxhist': flags.tf_maxlen - flags.unroll_length
     }
     return params
 
@@ -800,50 +801,101 @@ class PositionalEncoder(nn.Module):
             pe.append(pos_enc)
 
         pe = torch.stack(pe, dim=1)
-        if self.maxlen:
-            pe = pe[-self.maxlen:]
+        #if self.maxlen:
+        #    pe = pe[-self.maxlen:]
         return pe
 
     def forward(self, x, done_vector, beg_ind):
         pe = self.calc_pos(done_vector, beg_ind)
-        x = torch.cat([x[-self.maxlen:], pe.to(x.device)], dim=-1)
+        #x = torch.cat([x[-self.maxlen:], pe.to(x.device)], dim=-1)
         #x = x[-self.maxlen:] + pe.to(x.device)
+        x = x + pe.to(x.device)
         return x
 
 
-class BaseEncoderLayer(nn.TransformerEncoderLayer):
-    def forward(self, src, src_mask=None, src_key_padding_mask=None) -> torch.Tensor:
+class Gate(nn.Module):
+    def __init__(self, d_model):
+        super(Gate, self).__init__()
+        self.w_z = nn.Linear(d_model, d_model, bias=True)
+        self.u_z = nn.Linear(d_model, d_model, bias=False)
+        self.w_r = nn.Linear(d_model, d_model, bias=False)
+        self.u_r = nn.Linear(d_model, d_model, bias=False)
+        self.w_h = nn.Linear(d_model, d_model, bias=False)
+        self.u_h = nn.Linear(d_model, d_model, bias=False)
+        self.init_bias()
 
+    def init_bias(self):
+        self.w_z.bias.data.fill_(-2)
+
+    def forward(self, skip, proc):
+        z = torch.sigmoid(self.w_z(proc) + self.u_z(skip))
+        r = torch.sigmoid(self.w_r(proc) + self.u_r(skip))
+        h = torch.tanh(self.w_h(proc) + self.u_h(r * skip))
+        g = (1 - z) * skip + z * h
+        return g
+
+
+class BaseEncoderLayer(nn.Module):
+    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu",
+                 layer_norm_eps=1e-5, batch_first=False,
+                 device=None, dtype=None):
+        factory_kwargs = {'device': device, 'dtype': dtype}
+        super(BaseEncoderLayer, self).__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=batch_first,
+                                            **factory_kwargs)
+        # Implementation of Feedforward model
+        self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
+        self.dropout = nn.Dropout(dropout)
+        self.linear2 = nn.Linear(dim_feedforward, d_model, **factory_kwargs)
+
+        self.norm1 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.norm2 = nn.LayerNorm(d_model, eps=layer_norm_eps, **factory_kwargs)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+
+        self.activation = torch.relu
+
+        self.gate1 = Gate(d_model)
+        self.gate2 = Gate(d_model)
+
+
+    def forward(self, src, src_mask=None, src_key_padding_mask=None):
+        norm_src = self.norm1(src)
         src2 = list()
-        for batch_n in range(src.shape[1]):
-            s = src[:, batch_n:batch_n+1]
+        for batch_n in range(norm_src.shape[1]):
+            s = norm_src[:, batch_n:batch_n+1]
             s_mask = src_mask[batch_n]
             s2 = self.self_attn(s, s, s, attn_mask=s_mask)[0]
             src2.append(s2)
         src2 = torch.cat(src2, dim=1)
-        src = src + self.dropout1(src2)
-        src = self.norm1(src)
-        src2 = self.linear2(self.dropout(self.activation(self.linear1(src))))
-        src = src + self.dropout2(src2)
-        src = self.norm2(src)
+        src = self.gate1(src, self.dropout1(self.activation(src2)))
+
+        norm_src = self.norm2(src)
+        src2 = self.linear2(self.dropout(self.activation(self.linear1(norm_src))))
+        src = self.gate2(src, self.dropout2(self.activation(src2)))
         return src
 
 
+class BaseEncoder(nn.TransformerEncoder):
+    def generate_square_subsequent_mask(self, sz):
+        mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
+        mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+        return mask
+
+
 class TransformerEncoder(nn.Module):
-    def __init__(self, d_model=512, nhead=2, dim_feedforward=512, num_encoder_layers=1, maxlen=0):
+    def __init__(self, d_model=32, nhead=2, dim_feedforward=512, num_encoder_layers=4, maxlen=0, maxhist=0):
         super(TransformerEncoder, self).__init__()
         self.maxlen = maxlen
-        self.pos_enc = PositionalEncoder(d_model=10, maxlen=maxlen)
-        self.net = nn.Transformer(custom_encoder=BaseEncoderLayer(d_model+10, nhead, d_model+10),
-                                  custom_decoder=nn.Identity(),
-                                  d_model=d_model+10, nhead=nhead,
-                                  dim_feedforward=d_model+10,
-                                  num_encoder_layers=num_encoder_layers)
+        self.maxhist = maxhist
+        self.pos_enc = PositionalEncoder(d_model=d_model, maxlen=maxlen)
+        self.net = BaseEncoder(encoder_layer=BaseEncoderLayer(d_model, nhead, dim_feedforward),
+                               num_layers=num_encoder_layers, norm=None)
 
     def forward(self, inp, done_vector, beg_ind):
         mask = self.get_mask(done_vector).to(inp.device)
         inp = self.pos_enc(inp, done_vector, beg_ind)
-        out = self.net.encoder(inp, src_mask=mask)
+        out = self.net(inp, mask=mask)
         return out
 
     def get_mask(self, done_vector):
@@ -851,7 +903,7 @@ class TransformerEncoder(nn.Module):
         mask = torch.full((batch_size, vec_l, vec_l), float("-inf"), dtype=torch.float32)
 
         done_vector[-1] = True
-        for bn, done in enumerate(done_vector.transpose(0,1)):
+        for bn, done in enumerate(done_vector.transpose(0, 1)):
             cuts = torch.where(done)[0]
             cuts[1:] = cuts[1:] - cuts[:-1]
             cuts[-1] += 1
@@ -859,10 +911,17 @@ class TransformerEncoder(nn.Module):
             curr_ind = 0
             for cut in cuts:
                 partial_mask = self.net.generate_square_subsequent_mask(cut)
+
+                d = partial_mask.shape[0] - self.maxhist
+                if d > 0:
+                    d_mask = torch.full((d, d), -float('inf'))
+                    d_mask = torch.triu(d_mask).T
+                    partial_mask[-d:, :d] = d_mask
+
                 mask[bn, curr_ind:curr_ind+cut, curr_ind:curr_ind+cut] = partial_mask
                 curr_ind += cut
-        if self.maxlen:
-            mask = mask[:, -self.maxlen:, -self.maxlen:]
+        #if self.maxlen:
+        #    mask = mask[:, -self.maxlen:, -self.maxlen:]
         return mask
 
 
@@ -969,14 +1028,15 @@ class NetHackNet(nn.Module):
                 'nhead': 2,
                 'dim_feedforward': 512,
                 'num_encoder_layers': 1,
-                'maxlen': 0
+                'maxlen': 180,
+                'maxhist': 100,
             }
             if tf_params:
                 params.update(tf_params)
             self.core = TransformerEncoder(**params)
 
-        self.policy = nn.Linear(self.h_dim+10, self.num_actions)
-        self.baseline = nn.Linear(self.h_dim+10, 1)
+        self.policy = nn.Linear(self.h_dim, self.num_actions)
+        self.baseline = nn.Linear(self.h_dim, 1)
 
     def initial_state(self, batch_size=1):
         return torch.zeros(0, batch_size, H_DIM), torch.zeros(0, batch_size), torch.zeros(batch_size)
