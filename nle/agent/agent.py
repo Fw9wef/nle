@@ -975,8 +975,8 @@ class NetHackNet(nn.Module):
                 params.update(tf_params)
             self.core = TransformerEncoder(**params)
 
-        self.policy = nn.Linear(self.h_dim*2, self.num_actions)
-        self.baseline = nn.Linear(self.h_dim*2, 1)
+        self.policy = nn.Linear(self.h_dim+10, self.num_actions)
+        self.baseline = nn.Linear(self.h_dim+10, 1)
 
     def initial_state(self, batch_size=1):
         return torch.zeros(0, batch_size, H_DIM), torch.zeros(0, batch_size), torch.zeros(batch_size)
