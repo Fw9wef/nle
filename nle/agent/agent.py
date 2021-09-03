@@ -861,13 +861,7 @@ class BaseEncoderLayer(nn.Module):
 
     def forward(self, src, src_mask=None, src_key_padding_mask=None):
         norm_src = self.norm1(src)
-        src2 = list()
-        for batch_n in range(norm_src.shape[1]):
-            s = norm_src[:, batch_n:batch_n+1]
-            s_mask = src_mask[batch_n]
-            s2 = self.self_attn(s, s, s, attn_mask=s_mask)[0]
-            src2.append(s2)
-        src2 = torch.cat(src2, dim=1)
+        src2 = self.self_attn(norm_src, norm_src, norm_src, attn_mask=src_mask)[0]
         src = self.gate1(src, self.dropout1(self.activation(src2)))
 
         norm_src = self.norm2(src)

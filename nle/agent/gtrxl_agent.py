@@ -76,11 +76,11 @@ parser.add_argument("--disable_cuda", action="store_true",
                     help="Disable CUDA.")
 parser.add_argument("--use_lstm", action="store_true",
                     help="Use LSTM in agent model.")
-parser.add_argument("--tf_layers", default=1, type=int,
+parser.add_argument("--tf_layers", default=4, type=int,
                     help='number of transformer layers')
-parser.add_argument("--tf_nheads", default=2, type=int,
+parser.add_argument("--tf_nheads", default=4, type=int,
                     help='number of attention heads')
-parser.add_argument("--dim_feedforward", default=512, type=int,
+parser.add_argument("--dim_feedforward", default=32, type=int,
                     help="transformer feedforward dim")
 
 # Loss settings.
@@ -136,7 +136,7 @@ def nested_map(f, n):
 
 
 def compute_baseline_loss(advantages, pad_mask=None):
-    if pad_mask:
+    if pad_mask is not None:
         advantages = advantages * pad_mask
     return 0.5 * torch.sum(advantages ** 2)
 
@@ -145,9 +145,10 @@ def compute_entropy_loss(logits, pad_mask=None):
     """Return the entropy loss, i.e., the negative entropy of the policy."""
     policy = F.softmax(logits, dim=-1)
     log_policy = F.log_softmax(logits, dim=-1)
-    if pad_mask:
-        policy = policy * pad_mask
-    return torch.sum(policy * log_policy)
+    l = policy * log_policy
+    if pad_mask is not None:
+        l *= pad_mask.unsqueeze(-1)
+    return torch.sum(l)
 
 
 def compute_policy_gradient_loss(logits, actions, advantages, pad_mask=None):
@@ -157,7 +158,7 @@ def compute_policy_gradient_loss(logits, actions, advantages, pad_mask=None):
         reduction="none",
     )
     cross_entropy = cross_entropy.view_as(advantages)
-    if pad_mask:
+    if pad_mask is not None:
         cross_entropy = cross_entropy * pad_mask
     return torch.sum(cross_entropy * advantages.detach())
 
@@ -181,7 +182,7 @@ def act(
         env = ResettingEnvironment(gym_env)
         env_output = env.initial()
         initial_agent_state = model.initial_state(batch_size=1)
-        agent_output, unused_delta_state = model(env_output, initial_agent_state)
+        agent_output, unused_delta_state = model(env_output, initial_agent_state[:flags.tf_layers+2])
 
         while True:
             index = free_queue.get()
@@ -248,7 +249,8 @@ def get_batch(
     batch = {
         key: torch.stack([buffers[key][m] for m in indices], dim=1) for key in buffers
     }
-    agent_state = (torch.cat([agent_state_buffers[m][k] for m in indices], dim=1) for k in range(flags.tf_layers+2))
+    agent_state = [torch.cat([agent_state_buffers[m][k] for m in indices], dim=1) for k in range(flags.tf_layers+2)]
+    agent_state[-1] = torch.cat([agent_state[-1], torch.ones_like(agent_state[-1][:1])])
 
     for m in indices:
         free_queue.put(m)
@@ -832,6 +834,7 @@ class RMHA(nn.Module):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(RMHA, self).__init__()
         self.embed_dim = embed_dim
+        self.bias = bias
 
         self.num_heads = num_heads
         self.batch_first = batch_first
@@ -841,15 +844,15 @@ class RMHA(nn.Module):
         self.q_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
         self.k_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
         self.v_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
-        self.pos_proj_weight = nn.Parameter(torch.empty((embed_dim, embed_dim), **factory_kwargs))
-        self.V_vec = nn.Parameter(torch.empty(embed_dim, **factory_kwargs))
-        self.U_vec = nn.Parameter(torch.empty(embed_dim, **factory_kwargs))
+        self.pos_proj_weight = nn.Parameter(torch.empty((self.head_dim, embed_dim), **factory_kwargs))
+        self.V_vec = nn.Parameter(torch.empty((self.head_dim, 1), **factory_kwargs))
+        self.U_vec = nn.Parameter(torch.empty((self.head_dim, 1), **factory_kwargs))
 
         if bias:
             self.bias_q = nn.Parameter(torch.empty(embed_dim, **factory_kwargs))
             self.bias_k = nn.Parameter(torch.empty(embed_dim, **factory_kwargs))
             self.bias_v = nn.Parameter(torch.empty(embed_dim, **factory_kwargs))
-            self.bias_pos = nn.Parameter(torch.empty(embed_dim, **factory_kwargs))
+            self.bias_pos = nn.Parameter(torch.empty(self.head_dim, **factory_kwargs))
         else:
             self.register_parameter('bias_q', None)
             self.register_parameter('bias_k', None)
@@ -868,22 +871,21 @@ class RMHA(nn.Module):
         nn.init.xavier_uniform_(self.V_vec)
         nn.init.xavier_uniform_(self.U_vec)
 
-        if self.in_proj_bias is not None:
-            nn.init.constant_(self.in_proj_bias, 0.)
+        if self.bias:
+            nn.init.constant_(self.bias_q, 0.)
+            nn.init.constant_(self.bias_k, 0.)
+            nn.init.constant_(self.bias_v, 0.)
+            nn.init.constant_(self.bias_pos, 0.)
             nn.init.constant_(self.out_proj.bias, 0.)
-        if self.bias_k is not None:
-            nn.init.xavier_normal_(self.bias_k)
-        if self.bias_v is not None:
-            nn.init.xavier_normal_(self.bias_v)
 
     def forward(self, inp, prev_window, pos_encoding, key_padding_mask=None, attn_mask=None):
         prev_window = prev_window.detach()
         if self.batch_first:
             inp.transpose_(0, 1)
             prev_window.transpose_(0, 1)
-        e_inp = torch.cat([prev_window, inp], dim=1)
+        e_inp = torch.cat([prev_window, inp], dim=0)
 
-        q = F.linear(inp, self.q_proj_weight, self.in_proj_bias)  # (Nt, B, d)
+        q = F.linear(inp, self.q_proj_weight, self.bias_q)  # (Nt, B, d)
         k = F.linear(e_inp, self.k_proj_weight, self.bias_k)  # (Ns, B, d)
         v = F.linear(e_inp, self.v_proj_weight, self.bias_v)  # (Ns, B, d)
 
@@ -893,13 +895,13 @@ class RMHA(nn.Module):
         v = v.view(kv_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B`, Ns, d`)
 
         pos_l = pos_encoding.shape[0]
-        pos_encoding_i = pos_encoding.unsquuze(0)  # (L, d) -> (1, L, d)
+        pos_encoding_i = pos_encoding.unsqueeze(0)  # (L, d) -> (1, L, d)
         pos_encoding_i = pos_encoding_i.repeat(pos_l, 1, 1)  # (L, L, d)
-        pos_encoding_j = pos_encoding.unsquuze(1)  # (L, d) -> (L, 1, d)
+        pos_encoding_j = pos_encoding.unsqueeze(1)  # (L, d) -> (L, 1, d)
         pos_encoding_j = pos_encoding_j.repeat(1, pos_l, 1)  # (L, L, d)
         relative_pos_enc = (pos_encoding_i - pos_encoding_j).view(pos_l*pos_l, -1)  # (L*L, d)
-        r = F.linear(relative_pos_enc, self.pos_proj_weight, self.bias_pos).view(pos_l, pos_l, -1)  # (L, L, d)
-        r = r[:q_len, :kv_len, ...].unsqueeze(0)  # (1, Nt, Ns, d)
+        r = F.linear(relative_pos_enc, self.pos_proj_weight, self.bias_pos).view(pos_l, pos_l, -1)  # (L, L, d')
+        r = r[:q_len, :kv_len, ...].unsqueeze(0)  # (1, Nt, Ns, d')
 
         qk_attn = torch.bmm(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B', Nt, Ns)
         k_attn = (self.U_vec.view(1, 1, -1) * k).sum(dim=-1).unsqueeze(1).repeat(1, q_len, 1)  # (B`, Nt, Ns)
@@ -907,11 +909,7 @@ class RMHA(nn.Module):
         r_attn = (self.V_vec.view(1, 1, 1, -1) * r).sum(dim=-1)  # (B', Nt, Ns)
         attn = qk_attn + k_attn + qr_attn + r_attn  # (B', Nt, Ns)
 
-        mask = torch.zeros((1, q_len, kv_len))  # (1, Nt, Ns)
-        if attn_mask:  # (Nt, Ns)
-            mask += attn_mask.unsqueeze(0)
-        if key_padding_mask:  # (B, Nt, Ns)
-            mask = mask + key_padding_mask
+        mask = attn_mask.unsqueeze(0) + key_padding_mask  # (B, Nt, Ns)
         mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, q_len, kv_len)  # (B', Nt, Ns)
 
         attn += mask  # (B', Nt, Ns)
@@ -959,6 +957,7 @@ class BaseEncoderLayer(nn.Module):
 class BaseEncoder(nn.Module):
     def __init__(self, num_layers, d_model, num_heads, dim_feedforward, unroll_len):
         super(BaseEncoder, self).__init__()
+        self.d_model = d_model
         self.num_layers = num_layers
         self.unroll_len = unroll_len
         pe = self.generate_pos_enc_mtx(unroll_len*3)
@@ -966,10 +965,10 @@ class BaseEncoder(nn.Module):
         mask = self.generate_square_subsequent_mask(unroll_len*3)
         self.register_buffer('attn_mask', mask)
 
-        self.encoding_layers = list(
+        self.encoding_layers = nn.ModuleList([
             BaseEncoderLayer(d_model, nhead=num_heads, dim_feedforward=dim_feedforward)
             for _ in range(num_layers)
-            )
+            ])
 
     def forward(self, core_input, done, prev_window_states):
         core_len = core_input.shape[0]
@@ -980,12 +979,12 @@ class BaseEncoder(nn.Module):
         src_key_padding_mask = self.generate_pad_mask(done, core_len, prev_len)
 
         out = core_input
-        new_window_states = [out]
+        new_window_states = list()
         for i in range(self.num_layers):
+            new_window_states.append(out)
             out = self.encoding_layers[i](out, prev_window_states[i],
                                           pos_encoding, src_mask=src_mask,
                                           src_key_padding_mask=src_key_padding_mask)
-            new_window_states.append(out)
 
         return out, new_window_states
 
@@ -1000,7 +999,7 @@ class BaseEncoder(nn.Module):
         assert done_len == core_len + prev_len, "error in pad mask gen"
         mask = list()
         for v in done.transpose(0, 1):  # (L,)
-            m = v.unsqueeze(0).repeat(core_len, 1)
+            m = v.unsqueeze(0).float().repeat(core_len, 1)
             m = m.masked_fill(m > 0, float('-inf'))
             mask.append(m)
         mask = torch.stack(mask, dim=0)
@@ -1147,10 +1146,11 @@ class NetHackNet(nn.Module):
         init_state = (
             *(torch.zeros((self.unroll_length, batch_size, H_DIM)) for _ in range(self.tf_layers)),
             torch.ones((self.unroll_length, batch_size)),
-            *(torch.zeros((self.unroll_length, batch_size, H_DIM)) for _ in range(self.tf_layers)),
             torch.ones((self.unroll_length, batch_size)),
+            *(torch.zeros((self.unroll_length, batch_size, H_DIM)) for _ in range(self.tf_layers)),
             torch.zeros((1,), dtype=torch.uint8)
         )
+        init_state[self.tf_layers+1][0, ...] = 0
         return init_state
 
     def _select(self, embed, x):
@@ -1235,7 +1235,7 @@ class NetHackNet(nn.Module):
         if self.use_lstm:
             prev_window_states, prev_done, curr_done = past_window[:-2], past_window[-2], past_window[-1]
             core_input = st.view(T, B, -1)
-            if past_st:
+            if past_st is not None:
                 core_input = torch.cat([past_st, core_input], dim=0)
             done = torch.cat([prev_done, curr_done[:core_input.shape[0]]], dim=0)
 
