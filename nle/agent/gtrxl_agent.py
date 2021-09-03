@@ -121,6 +121,7 @@ def get_tf_params(flags):
         'nhead': flags.tf_nheads,
         'dim_feedforward': flags.dim_feedforward,
         'num_encoder_layers': flags.tf_layers,
+        'unroll_len': flags.unroll_length
     }
     return params
 
@@ -134,24 +135,30 @@ def nested_map(f, n):
         return f(n)
 
 
-def compute_baseline_loss(advantages):
+def compute_baseline_loss(advantages, pad_mask=None):
+    if pad_mask:
+        advantages = advantages * pad_mask
     return 0.5 * torch.sum(advantages ** 2)
 
 
-def compute_entropy_loss(logits):
+def compute_entropy_loss(logits, pad_mask=None):
     """Return the entropy loss, i.e., the negative entropy of the policy."""
     policy = F.softmax(logits, dim=-1)
     log_policy = F.log_softmax(logits, dim=-1)
+    if pad_mask:
+        policy = policy * pad_mask
     return torch.sum(policy * log_policy)
 
 
-def compute_policy_gradient_loss(logits, actions, advantages):
+def compute_policy_gradient_loss(logits, actions, advantages, pad_mask=None):
     cross_entropy = F.nll_loss(
         F.log_softmax(torch.flatten(logits, 0, 1), dim=-1),
         target=torch.flatten(actions, 0, 1),
         reduction="none",
     )
     cross_entropy = cross_entropy.view_as(advantages)
+    if pad_mask:
+        cross_entropy = cross_entropy * pad_mask
     return torch.sum(cross_entropy * advantages.detach())
 
 
@@ -175,7 +182,6 @@ def act(
         env_output = env.initial()
         initial_agent_state = model.initial_state(batch_size=1)
         agent_output, unused_delta_state = model(env_output, initial_agent_state)
-        past_st = list()
 
         while True:
             index = free_queue.get()
@@ -192,25 +198,21 @@ def act(
             for key in agent_output:
                 buffers[key][index][0, ...] = agent_output[key]
             for i in range(flags.tf_layers):
-                agent_state_buffers[index][i][...] = agent_state_buffers[index][i+flags.tf_layers+1][...]
-            agent_state_buffers[index][flags.tf_layers][...] = agent_state_buffers[index][-2]
-            agent_state_buffers[index][-2].fill_(1)
-
-            past_st.clear()
-            past_st.append(torch.empty((0, 1, H_DIM)))
+                agent_state_buffers[index][i][...] = agent_state_buffers[index][i+flags.tf_layers+2][...]
+            agent_state_buffers[index][flags.tf_layers][...] = agent_state_buffers[index][flags.tf_layers+1]
+            agent_state_buffers[index][flags.tf_layers+1].fill_(1)
 
             # Do new rollout.
             for t in range(flags.unroll_length):
+                agent_state_buffers[index][flags.tf_layers + 1][t, ...] = 0
                 with torch.no_grad():
                     agent_output, agent_delta_state = model(env_output,
-                                                            agent_state_buffers[index][:flags.tf_layers+1],
-                                                            torch.cat(past_st, dim=0))
+                                                            agent_state_buffers[index][:flags.tf_layers+2],
+                                                            agent_state_buffers[index][flags.tf_layers+2][:t])
 
-                past_st.append(agent_delta_state[0])
-                agent_state_buffers[index][-2][t, ...] = 0
                 for i, delta in enumerate(agent_delta_state):
                     time_delta = delta.shape[0]
-                    agent_state_buffers[index][i+flags.tf_layers+1][t:t+time_delta, ...] = delta
+                    agent_state_buffers[index][i+flags.tf_layers+2][t:t+time_delta, ...] = delta
                 env_output = env.step(agent_output["action"])
                 agent_state_buffers[index][-1][...] = env_output['done'].item()
 
@@ -246,7 +248,7 @@ def get_batch(
     batch = {
         key: torch.stack([buffers[key][m] for m in indices], dim=1) for key in buffers
     }
-    agent_state = (torch.cat([agent_state_buffers[m][k] for m in indices], dim=1) for k in range(flags.tf_layers+1))
+    agent_state = (torch.cat([agent_state_buffers[m][k] for m in indices], dim=1) for k in range(flags.tf_layers+2))
 
     for m in indices:
         free_queue.put(m)
@@ -269,6 +271,7 @@ def learn(
 ):
     """Performs a learning (optimization) step."""
     with lock:
+        pad_mask = initial_agent_state[-1]  # (T, B)
         learner_outputs, unused_state = model(batch, initial_agent_state)
 
         # Take final value function slice for bootstrapping.
@@ -277,6 +280,7 @@ def learn(
         # Move from obs[t] -> action[t] to action[t] -> obs[t].
         batch = {key: tensor[1:] for key, tensor in batch.items()}
         learner_outputs = {key: tensor[:-1] for key, tensor in learner_outputs.items()}
+        pad_mask = 1 - pad_mask[:-1]
 
         rewards = batch["reward"]
         if flags.reward_clipping == "abs_one":
@@ -302,12 +306,15 @@ def learn(
             learner_outputs["policy_logits"],
             batch["action"],
             vtrace_returns.pg_advantages,
+            pad_mask=pad_mask
         )
         baseline_loss = flags.baseline_cost * compute_baseline_loss(
-            vtrace_returns.vs - learner_outputs["baseline"]
+            vtrace_returns.vs - learner_outputs["baseline"],
+            pad_mask=pad_mask
         )
         entropy_loss = flags.entropy_cost * compute_entropy_loss(
-            learner_outputs["policy_logits"]
+            learner_outputs["policy_logits"],
+            pad_mask=pad_mask
         )
 
         total_loss = pg_loss + baseline_loss + entropy_loss
@@ -377,8 +384,8 @@ def create_state_buffers(flags):
         initial_agent_state_buffers.append([
         *[torch.zeros((flags.unroll_length, 1, H_DIM)).share_memory_() for _ in range(flags.tf_layers)],
         torch.ones((flags.unroll_length, 1), dtype=torch.uint8).share_memory_(),
-        *[torch.zeros((flags.unroll_length, 1, H_DIM)).share_memory_() for _ in range(flags.tf_layers)],
         torch.ones((flags.unroll_length, 1), dtype=torch.uint8).share_memory_(),
+        *[torch.zeros((flags.unroll_length, 1, H_DIM)).share_memory_() for _ in range(flags.tf_layers)],
         torch.zeros((1,), dtype=torch.uint8).share_memory_()
         ])
     return initial_agent_state_buffers
@@ -900,12 +907,14 @@ class RMHA(nn.Module):
         r_attn = (self.V_vec.view(1, 1, 1, -1) * r).sum(dim=-1)  # (B', Nt, Ns)
         attn = qk_attn + k_attn + qr_attn + r_attn  # (B', Nt, Ns)
 
-        mask = torch.zeros((q_len, kv_len))
-        if attn_mask:
-            mask += attn_mask
-        if key_padding_mask:
-            mask += key_padding_mask
-        attn += mask.unsqueeze(0)  # (B', Nt, Ns)
+        mask = torch.zeros((1, q_len, kv_len))  # (1, Nt, Ns)
+        if attn_mask:  # (Nt, Ns)
+            mask += attn_mask.unsqueeze(0)
+        if key_padding_mask:  # (B, Nt, Ns)
+            mask = mask + key_padding_mask
+        mask = mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, q_len, kv_len)  # (B', Nt, Ns)
+
+        attn += mask  # (B', Nt, Ns)
 
         soft_attn = F.softmax(attn, dim=-1)  # (B', Nt, Ns)
         out = torch.bmm(soft_attn, v).view(bsz, q_len, self.embed_dim).transpose(0, 1)  # (Nt, B, d)
@@ -916,11 +925,11 @@ class RMHA(nn.Module):
 
 class BaseEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0., activation="relu",
-                 layer_norm_eps=1e-5, batch_first=False,
-                 device=None, dtype=None):
+                 layer_norm_eps=1e-5, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(BaseEncoderLayer, self).__init__()
-        self.self_attn = RMHA(embed_dim=d_model, num_heads=nhead, bias=True, **factory_kwargs)
+        self.self_attn = RMHA(embed_dim=d_model, num_heads=nhead, bias=True,
+                              layer_norm_eps=layer_norm_eps, **factory_kwargs)
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
@@ -944,37 +953,79 @@ class BaseEncoderLayer(nn.Module):
         norm_src = self.norm2(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(norm_src))))
         src = self.gate2(src, self.dropout2(self.activation(src2)))
-        return src, attn_out
+        return src
 
 
 class BaseEncoder(nn.Module):
-    def __init__(self):
+    def __init__(self, num_layers, d_model, num_heads, dim_feedforward, unroll_len):
         super(BaseEncoder, self).__init__()
+        self.num_layers = num_layers
+        self.unroll_len = unroll_len
+        pe = self.generate_pos_enc_mtx(unroll_len*3)
+        self.register_buffer('positional_encoding', pe)
+        mask = self.generate_square_subsequent_mask(unroll_len*3)
+        self.register_buffer('attn_mask', mask)
 
-    def forward(self):
-        pass
+        self.encoding_layers = list(
+            BaseEncoderLayer(d_model, nhead=num_heads, dim_feedforward=dim_feedforward)
+            for _ in range(num_layers)
+            )
+
+    def forward(self, core_input, done, prev_window_states):
+        core_len = core_input.shape[0]
+        prev_len = prev_window_states[0].shape[0]
+
+        pos_encoding = self.positional_encoding[:core_len + prev_len]
+        src_mask = self.attn_mask[-core_len:, -core_len-prev_len:]
+        src_key_padding_mask = self.generate_pad_mask(done, core_len, prev_len)
+
+        out = core_input
+        new_window_states = [out]
+        for i in range(self.num_layers):
+            out = self.encoding_layers[i](out, prev_window_states[i],
+                                          pos_encoding, src_mask=src_mask,
+                                          src_key_padding_mask=src_key_padding_mask)
+            new_window_states.append(out)
+
+        return out, new_window_states
+
 
     def generate_square_subsequent_mask(self, sz):
         mask = (torch.triu(torch.ones(sz, sz)) == 1).transpose(0, 1)
         mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
         return mask
 
+    def generate_pad_mask(self, done, core_len, prev_len):
+        done_len = done.shape[0]
+        assert done_len == core_len + prev_len, "error in pad mask gen"
+        mask = list()
+        for v in done.transpose(0, 1):  # (L,)
+            m = v.unsqueeze(0).repeat(core_len, 1)
+            m = m.masked_fill(m > 0, float('-inf'))
+            mask.append(m)
+        mask = torch.stack(mask, dim=0)
+        return mask
+
+    def generate_pos_enc_mtx(self, unroll_len):
+        pe = list()
+        for i in range(0, self.d_model, 2):
+            s = torch.sin(torch.arange(unroll_len, dtype=torch.float32) / (10000 ** ((2 * i) / self.d_model)))
+            c = torch.cos(torch.arange(unroll_len, dtype=torch.float32) / (10000 ** ((2 * (i + 1)) / self.d_model)))
+            pe.extend((s, c))
+        pe = torch.stack(pe, dim=1)
+        return pe
+
 
 class TransformerEncoder(nn.Module):
-    def __init__(self, d_model=32, nhead=2, dim_feedforward=512, num_encoder_layers=4, maxlen=0, maxhist=0):
+    def __init__(self, d_model=32, nhead=5, dim_feedforward=32, num_encoder_layers=4, unroll_len=80):
         super(TransformerEncoder, self).__init__()
-        self.maxlen = maxlen
-        self.maxhist = maxhist
-        self.net = BaseEncoder(encoder_layer=BaseEncoderLayer(d_model, nhead, dim_feedforward),
-                               num_layers=num_encoder_layers, norm=None)
+        self.net = BaseEncoder(num_layers=num_encoder_layers, d_model=d_model,
+                               num_heads=nhead, dim_feedforward=dim_feedforward,
+                               unroll_len=unroll_len)
 
     def forward(self, inp, done_vector, prev_window_states):
-        pad_mask = self.get_pad_mask(done_vector)
-        out = self.net(inp, mask=self.mask, src_key_padding_mask=pad_mask)
-        return out
-
-    def get_masks(self, done_vector):
-        pass
+        out, new_window_states = self.net(core_input=inp, done=done_vector, prev_window_states=prev_window_states)
+        return out, new_window_states
 
 
 class NetHackNet(nn.Module):
@@ -1079,11 +1130,10 @@ class NetHackNet(nn.Module):
         if self.use_lstm:
             params = {
                 'd_model': H_DIM,
-                'nhead': 2,
-                'dim_feedforward': 512,
-                'num_encoder_layers': 1,
-                'maxlen': 180,
-                'maxhist': 100,
+                'nhead': 4,
+                'dim_feedforward': 32,
+                'num_encoder_layers': 4,
+                'unroll_len': 80,
             }
             if tf_params:
                 params.update(tf_params)
@@ -1183,16 +1233,18 @@ class NetHackNet(nn.Module):
         st = self.fc(st)
 
         if self.use_lstm:
-            prev_window_states, prev_done = past_window[:-1], past_window[-1]
+            prev_window_states, prev_done, curr_done = past_window[:-2], past_window[-2], past_window[-1]
             core_input = st.view(T, B, -1)
             if past_st:
                 core_input = torch.cat([past_st, core_input], dim=0)
-            done = torch.cat([prev_done, torch.zeros((core_input.shape[0], 1), dtype=torch.uint8)], dim=0)
+            done = torch.cat([prev_done, curr_done[:core_input.shape[0]]], dim=0)
 
-            core_output, states = self.core(core_input, done, prev_window_states)
+            core_output, new_window_states = self.core(core_input, done, prev_window_states)
             core_output = core_output[-T:].view(T*B, -1)
+            new_window_states = [state[-T:] for state in new_window_states]
         else:
             core_output = st
+            new_window_states = list()
 
         # -- [B x A]
         policy_logits = self.policy(core_output)
@@ -1211,7 +1263,7 @@ class NetHackNet(nn.Module):
 
         return (
             dict(policy_logits=policy_logits, baseline=baseline, action=action),
-            states,
+            new_window_states
         )
 
 
