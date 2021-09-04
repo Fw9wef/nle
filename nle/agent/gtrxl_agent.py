@@ -60,6 +60,10 @@ parser.add_argument("--disable_checkpoint", action="store_true",
                     help="Disable saving checkpoint.")
 parser.add_argument("--savedir", default="~/torchbeast/",
                     help="Root dir where experiment data will be saved.")
+parser.add_argument("--resume_train", action="store_true",
+                    help="Resume training from checkpoint")
+parser.add_argument("--model_path", default="~/torchbeast/",
+                    help="Path to model checkpoint")
 parser.add_argument("--num_actors", default=16, type=int, metavar="N",
                     help="Number of actors (default: 4).")
 parser.add_argument("--total_steps", default=1000000000, type=int, metavar="T",
@@ -182,13 +186,14 @@ def act(
         env = ResettingEnvironment(gym_env)
         env_output = env.initial()
         initial_agent_state = model.initial_state(batch_size=1)
-        agent_output, unused_delta_state = model(env_output, initial_agent_state[:flags.tf_layers+2])
+        agent_output, *_ = model(env_output, initial_agent_state[:flags.tf_layers+2])
 
         while True:
             index = free_queue.get()
             if index is None:
                 break
 
+            list_ff_data = None
             if agent_state_buffers[index][-1].item():
                 for i, t in enumerate(initial_agent_state):
                     agent_state_buffers[index][i][...] = t
@@ -207,9 +212,9 @@ def act(
             for t in range(flags.unroll_length):
                 agent_state_buffers[index][flags.tf_layers + 1][t, ...] = 0
                 with torch.no_grad():
-                    agent_output, agent_delta_state = model(env_output,
-                                                            agent_state_buffers[index][:flags.tf_layers+2],
-                                                            agent_state_buffers[index][flags.tf_layers+2][:t])
+                    agent_output, agent_delta_state, list_ff_data = model(env_output,
+                                                                          agent_state_buffers[index][:flags.tf_layers+2],
+                                                                          list_ff_data, t)
 
                 for i, delta in enumerate(agent_delta_state):
                     time_delta = delta.shape[0]
@@ -274,7 +279,7 @@ def learn(
     """Performs a learning (optimization) step."""
     with lock:
         pad_mask = initial_agent_state[-1]  # (T, B)
-        learner_outputs, unused_state = model(batch, initial_agent_state)
+        learner_outputs, *_ = model(batch, initial_agent_state)
 
         # Take final value function slice for bootstrapping.
         bootstrap_value = learner_outputs["baseline"][-1]
@@ -677,41 +682,7 @@ def train(flags):  # pylint: disable=too-many-branches, too-many-statements
 
 
 def test(flags, num_episodes=10):
-    flags.savedir = os.path.expandvars(os.path.expanduser(flags.savedir))
-    checkpointpath = os.path.join(flags.savedir, "latest", "model.tar")
-
-    gym_env = create_env(flags.env)
-    env = ResettingEnvironment(gym_env)
-    tf_params = get_tf_params(flags)
-    model = Net(gym_env.observation_space, gym_env.action_space.n, flags.use_lstm, tf_params=tf_params)
-    model.eval()
-    checkpoint = torch.load(checkpointpath, map_location="cpu")
-    model.load_state_dict(checkpoint["model_state_dict"])
-
-    observation = env.initial()
-    returns = []
-
-    agent_state = model.initial_state(batch_size=1)
-    agent_state_buffer = StateBuffer(agent_state)
-
-    while len(returns) < num_episodes:
-        if flags.mode == "test_render":
-            env.gym_env.render()
-        policy_outputs, agent_state = model(observation, agent_state_buffer.get_last())
-        agent_state_buffer.append(agent_state)
-        observation = env.step(policy_outputs["action"])
-        if observation["done"].item():
-            returns.append(observation["episode_return"].item())
-            agent_state_buffer.cleening()
-            logging.info(
-                "Episode ended after %d steps. Return: %.1f",
-                observation["episode_step"].item(),
-                observation["episode_return"].item(),
-            )
-    env.close()
-    logging.info(
-        "Average returns over %i steps: %.1f", num_episodes, sum(returns) / len(returns)
-    )
+    print("Work in progress")
 
 
 class RandomNet(nn.Module):
@@ -829,8 +800,8 @@ class Gate(nn.Module):
 
 
 class RMHA(nn.Module):
-    def __init__(self, embed_dim, num_heads, bias=True,
-                 batch_first=False, device=None, dtype=None, layer_norm_eps=1e-5):
+    def __init__(self, embed_dim, num_heads, bias=True, batch_first=False,
+                 device=None, dtype=None, layer_norm_eps=1e-5, pos_mtx=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(RMHA, self).__init__()
         self.embed_dim = embed_dim
@@ -863,6 +834,14 @@ class RMHA(nn.Module):
         self.out_norm = nn.LayerNorm(embed_dim, eps=layer_norm_eps, **factory_kwargs)
         self._reset_parameters()
 
+        pos_l = pos_mtx.shape[0]
+        pos_encoding_i = pos_mtx.unsqueeze(0)  # (L, d) -> (1, L, d)
+        pos_encoding_i = pos_encoding_i.repeat(pos_l, 1, 1)  # (L, L, d)
+        pos_encoding_j = pos_mtx.unsqueeze(1)  # (L, d) -> (L, 1, d)
+        pos_encoding_j = pos_encoding_j.repeat(1, pos_l, 1)  # (L, L, d)
+        relative_pos_enc = (pos_encoding_i - pos_encoding_j)  # L, L, d)
+        self.register_buffer("relative_pos_enc", relative_pos_enc)
+
     def _reset_parameters(self):
         nn.init.xavier_uniform_(self.q_proj_weight)
         nn.init.xavier_uniform_(self.k_proj_weight)
@@ -878,7 +857,7 @@ class RMHA(nn.Module):
             nn.init.constant_(self.bias_pos, 0.)
             nn.init.constant_(self.out_proj.bias, 0.)
 
-    def forward(self, inp, prev_window, pos_encoding, key_padding_mask=None, attn_mask=None):
+    def forward(self, inp, prev_window, key_padding_mask=None, attn_mask=None):
         prev_window = prev_window.detach()
         if self.batch_first:
             inp.transpose_(0, 1)
@@ -894,14 +873,8 @@ class RMHA(nn.Module):
         k = k.view(kv_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B`, Ns, d`)
         v = v.view(kv_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B`, Ns, d`)
 
-        pos_l = pos_encoding.shape[0]
-        pos_encoding_i = pos_encoding.unsqueeze(0)  # (L, d) -> (1, L, d)
-        pos_encoding_i = pos_encoding_i.repeat(pos_l, 1, 1)  # (L, L, d)
-        pos_encoding_j = pos_encoding.unsqueeze(1)  # (L, d) -> (L, 1, d)
-        pos_encoding_j = pos_encoding_j.repeat(1, pos_l, 1)  # (L, L, d)
-        relative_pos_enc = (pos_encoding_i - pos_encoding_j).view(pos_l*pos_l, -1)  # (L*L, d)
-        r = F.linear(relative_pos_enc, self.pos_proj_weight, self.bias_pos).view(pos_l, pos_l, -1)  # (L, L, d')
-        r = r[:q_len, :kv_len, ...].unsqueeze(0)  # (1, Nt, Ns, d')
+        relative_pos_enc = self.relative_pos_enc[:q_len, :kv_len, ...]  # (Ns, Nt, d)
+        r = F.linear(relative_pos_enc, self.pos_proj_weight, self.bias_pos).unsqueeze(0)  # (1, Ns, Nt, d')
 
         qk_attn = torch.bmm(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B', Nt, Ns)
         k_attn = (self.U_vec.view(1, 1, -1) * k).sum(dim=-1).unsqueeze(1).repeat(1, q_len, 1)  # (B`, Nt, Ns)
@@ -918,16 +891,67 @@ class RMHA(nn.Module):
         out = torch.bmm(soft_attn, v).view(bsz, q_len, self.embed_dim).transpose(0, 1)  # (Nt, B, d)
 
         out = self.out_norm(inp + self.out_proj(out))
-        return out
+        ff_data = [q, k, v, k_attn[:, -1:]]
+        return out, ff_data
+
+    def fast_forward(self, inp, prev_ff_data, key_padding_mask=None):
+        prev_q, prev_k, prev_v, low_k_attn = prev_ff_data
+        assert not self.batch_first
+        assert inp.shape[0] == 1
+        bsz = inp.shape[1]
+        prev_q_len = prev_q.shape[1]
+        prev_kv_len = prev_k.shape[1]
+
+        new_q = F.linear(inp, self.q_proj_weight, self.bias_q).view(1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B', 1, d)
+        new_k = F.linear(inp, self.k_proj_weight, self.bias_k).view(1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B', 1, d)
+        new_v = F.linear(inp, self.v_proj_weight, self.bias_v).view(1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B', 1, d)
+
+        q = torch.cat([prev_q, new_q], dim=1)
+        k = torch.cat([prev_k, new_k], dim=1)
+        v = torch.cat([prev_v, new_v], dim=1)  # (B', prev_kv_len+1, d')
+
+        # compute delta r
+        low_r = self.relative_pos_enc[prev_q_len, :prev_kv_len+1]  # (prev_kv_len+1, d)
+        low_r = F.linear(low_r, self.pos_proj_weight, self.bias_pos).view(1, 1, prev_kv_len+1, -1)  # (1, 1, prev_kv_len+1, d')
+
+        # compute new qk_attn
+        low_qk_attn = torch.bmm(new_q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B', 1, prev_kv_len+1)
+
+        # compute new k_attn
+        new_low_k_attn = (self.U_vec.view(1, 1, -1) * new_k).sum(dim=-1).unsqueeze(1)  # (B', 1, 1)
+        low_k_attn = torch.cat([low_k_attn, new_low_k_attn], dim=-1)  # (B', 1, prev_kv_len+1)
+
+        # compute new qr_attn
+        low_qr_attn = (new_q.unsqueeze(2) * low_r).sum(dim=-1)  # (B', 1, prev_kv_len+1)
+
+        # compute new r_attn
+        low_r_attn = (self.V_vec.view(1, 1, 1, -1) * low_r).sum(dim=-1)  # (1, 1, prev_kv_len+1)
+
+        # compute new attn
+        low_attn = low_qk_attn + low_k_attn + low_qr_attn + low_r_attn
+
+        if key_padding_mask is not None:
+            key_padding_mask = key_padding_mask[:, -1:, :]
+            key_padding_mask = key_padding_mask.unsqueeze(1).repeat(1, self.num_heads, 1, 1).view(bsz * self.num_heads, 1, prev_kv_len+1)
+            low_attn += key_padding_mask  # (B', 1, prev_kv_len+1)
+
+        soft_attn = F.softmax(low_attn, dim=-1)  # (B', 1, prev_kv_len+1)
+        out = torch.bmm(soft_attn, v)  # (B', 1, d')
+        out = out.view(bsz, 1, self.embed_dim).transpose(0, 1)  # (1, B, d)
+        out = self.out_norm(inp + self.out_proj(out))
+
+        ff_data = [q, k, v, low_k_attn]
+        return out, ff_data
 
 
 class BaseEncoderLayer(nn.Module):
-    def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0., activation="relu",
+    def __init__(self, d_model, nhead, pos_mtx, dim_feedforward=2048, dropout=0., activation="relu",
                  layer_norm_eps=1e-5, device=None, dtype=None):
         factory_kwargs = {'device': device, 'dtype': dtype}
         super(BaseEncoderLayer, self).__init__()
         self.self_attn = RMHA(embed_dim=d_model, num_heads=nhead, bias=True,
-                              layer_norm_eps=layer_norm_eps, **factory_kwargs)
+                              layer_norm_eps=layer_norm_eps, pos_mtx=pos_mtx,
+                              **factory_kwargs)
         # Implementation of Feedforward model
         self.linear1 = nn.Linear(d_model, dim_feedforward, **factory_kwargs)
         self.dropout = nn.Dropout(dropout)
@@ -943,15 +967,19 @@ class BaseEncoderLayer(nn.Module):
         self.gate1 = Gate(d_model)
         self.gate2 = Gate(d_model)
 
-    def forward(self, src, prev_window, pos_encoding, src_mask=None, src_key_padding_mask=None):
+    def forward(self, src, prev_window, src_mask=None, src_key_padding_mask=None, ff_data=None):
         norm_src = self.norm1(src)
-        attn_out = self.self_attn(norm_src, prev_window, pos_encoding, key_padding_mask=src_key_padding_mask, attn_mask=src_mask)
+        if ff_data is not None:
+            attn_out, ff_data = self.self_attn.fast_forward(norm_src, ff_data,
+                                                            src_key_padding_mask)
+        else:
+            attn_out, ff_data = self.self_attn(norm_src, prev_window, key_padding_mask=src_key_padding_mask, attn_mask=src_mask)
         src = self.gate1(src, self.dropout1(self.activation(attn_out)))
 
         norm_src = self.norm2(src)
         src2 = self.linear2(self.dropout(self.activation(self.linear1(norm_src))))
         src = self.gate2(src, self.dropout2(self.activation(src2)))
-        return src
+        return src, ff_data
 
 
 class BaseEncoder(nn.Module):
@@ -961,32 +989,32 @@ class BaseEncoder(nn.Module):
         self.num_layers = num_layers
         self.unroll_len = unroll_len
         pe = self.generate_pos_enc_mtx(unroll_len*3)
-        self.register_buffer('positional_encoding', pe)
         mask = self.generate_square_subsequent_mask(unroll_len*3)
         self.register_buffer('attn_mask', mask)
 
         self.encoding_layers = nn.ModuleList([
-            BaseEncoderLayer(d_model, nhead=num_heads, dim_feedforward=dim_feedforward)
+            BaseEncoderLayer(d_model, nhead=num_heads, pos_mtx=pe, dim_feedforward=dim_feedforward)
             for _ in range(num_layers)
             ])
 
-    def forward(self, core_input, done, prev_window_states):
-        core_len = core_input.shape[0]
+    def forward(self, core_input, done, prev_window_states, list_ff_data=None, t=None):
         prev_len = prev_window_states[0].shape[0]
-
-        pos_encoding = self.positional_encoding[:core_len + prev_len]
-        src_mask = self.attn_mask[-core_len:, -core_len-prev_len:]
-        src_key_padding_mask = self.generate_pad_mask(done, core_len, prev_len)
+        src_mask = self.attn_mask[-t:, -t-prev_len:]
+        src_key_padding_mask = self.generate_pad_mask(done, t, prev_len)
 
         out = core_input
         new_window_states = list()
+        if list_ff_data is None:
+            list_ff_data = [None for _ in range(self.num_layers)]
+
         for i in range(self.num_layers):
             new_window_states.append(out)
-            out = self.encoding_layers[i](out, prev_window_states[i],
-                                          pos_encoding, src_mask=src_mask,
-                                          src_key_padding_mask=src_key_padding_mask)
+            out, ff_data = self.encoding_layers[i](out, prev_window_states[i], src_mask=src_mask,
+                                                   src_key_padding_mask=src_key_padding_mask,
+                                                   ff_data=list_ff_data[i])
+            list_ff_data[i] = ff_data
 
-        return out, new_window_states
+        return out, new_window_states, list_ff_data
 
 
     def generate_square_subsequent_mask(self, sz):
@@ -1022,9 +1050,11 @@ class TransformerEncoder(nn.Module):
                                num_heads=nhead, dim_feedforward=dim_feedforward,
                                unroll_len=unroll_len)
 
-    def forward(self, inp, done_vector, prev_window_states):
-        out, new_window_states = self.net(core_input=inp, done=done_vector, prev_window_states=prev_window_states)
-        return out, new_window_states
+    def forward(self, inp, done_vector, prev_window_states, list_ff_data, t):
+        out, new_window_states, list_ff_data = self.net(core_input=inp, done=done_vector,
+                                                        prev_window_states=prev_window_states,
+                                                        list_ff_data=list_ff_data, t=t)
+        return out, new_window_states, list_ff_data
 
 
 class NetHackNet(nn.Module):
@@ -1159,7 +1189,7 @@ class NetHackNet(nn.Module):
         out = embed.weight.index_select(0, x.reshape(-1))
         return out.reshape(x.shape + (-1,))
 
-    def forward(self, env_outputs, past_window, past_st=None):
+    def forward(self, env_outputs, past_window, list_ff_data=None, t=None):
         # -- [T x B x H x W]
         glyphs = env_outputs["glyphs"]
 
@@ -1235,11 +1265,11 @@ class NetHackNet(nn.Module):
         if self.use_lstm:
             prev_window_states, prev_done, curr_done = past_window[:-2], past_window[-2], past_window[-1]
             core_input = st.view(T, B, -1)
-            if past_st is not None:
-                core_input = torch.cat([past_st, core_input], dim=0)
-            done = torch.cat([prev_done, curr_done[:core_input.shape[0]]], dim=0)
-
-            core_output, new_window_states = self.core(core_input, done, prev_window_states)
+            t = t + 1 if t else core_input.shape[0]
+            done = torch.cat([prev_done, curr_done[:t]], dim=0)
+            core_output, new_window_states, list_ff_data = self.core(core_input, done,
+                                                                     prev_window_states,
+                                                                     list_ff_data, t)
             core_output = core_output[-T:].view(T*B, -1)
             new_window_states = [state[-T:] for state in new_window_states]
         else:
@@ -1263,7 +1293,7 @@ class NetHackNet(nn.Module):
 
         return (
             dict(policy_logits=policy_logits, baseline=baseline, action=action),
-            new_window_states
+            new_window_states, list_ff_data
         )
 
 
