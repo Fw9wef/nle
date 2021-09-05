@@ -58,10 +58,6 @@ parser.add_argument("--mode", default="train",
 # Training settings.
 parser.add_argument("--disable_checkpoint", action="store_true",
                     help="Disable saving checkpoint.")
-parser.add_argument("--savedir", default="~/torchbeast/",
-                    help="Root dir where experiment data will be saved.")
-parser.add_argument("--resume_train", action="store_true",
-                    help="Resume training from checkpoint")
 parser.add_argument("--model_path", default="~/torchbeast/",
                     help="Path to model checkpoint")
 parser.add_argument("--num_actors", default=16, type=int, metavar="N",
@@ -187,16 +183,25 @@ def act(
         env_output = env.initial()
         initial_agent_state = model.initial_state(batch_size=1)
         agent_output, *_ = model(env_output, initial_agent_state[:flags.tf_layers+2])
+        list_ff_data = None
 
         while True:
             index = free_queue.get()
             if index is None:
                 break
 
-            list_ff_data = None
             if agent_state_buffers[index][-1].item():
+                list_ff_data = None
                 for i, t in enumerate(initial_agent_state):
                     agent_state_buffers[index][i][...] = t
+
+            if list_ff_data is not None:
+                for i in range(len(list_ff_data)):
+                    k, v, low_k_attn = list_ff_data[i]
+                    k = k[:, -flags.unroll_length:, ...]
+                    v = v[:, -flags.unroll_length:, ...]
+                    low_k_attn = low_k_attn[:, :, -flags.unroll_length:]
+                    list_ff_data[i] = [k, v, low_k_attn]
 
             # Write old rollout end.
             for key in env_output:
@@ -381,7 +386,7 @@ def create_buffers(flags, observation_space, num_actions, num_overlapping_steps=
     buffers = {key: [] for key in specs}
     for _ in range(flags.num_buffers):
         for key in buffers:
-            buffers[key].append(torch.empty(**specs[key]).share_memory_())
+            buffers[key].append(torch.zeros(**specs[key]).share_memory_())
     return buffers
 
 
@@ -839,7 +844,7 @@ class RMHA(nn.Module):
         pos_encoding_i = pos_encoding_i.repeat(pos_l, 1, 1)  # (L, L, d)
         pos_encoding_j = pos_mtx.unsqueeze(1)  # (L, d) -> (L, 1, d)
         pos_encoding_j = pos_encoding_j.repeat(1, pos_l, 1)  # (L, L, d)
-        relative_pos_enc = (pos_encoding_i - pos_encoding_j)  # L, L, d)
+        relative_pos_enc = (pos_encoding_i - pos_encoding_j)  # (L, L, d)
         self.register_buffer("relative_pos_enc", relative_pos_enc)
 
     def _reset_parameters(self):
@@ -873,7 +878,7 @@ class RMHA(nn.Module):
         k = k.view(kv_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B`, Ns, d`)
         v = v.view(kv_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B`, Ns, d`)
 
-        relative_pos_enc = self.relative_pos_enc[:q_len, :kv_len, ...]  # (Ns, Nt, d)
+        relative_pos_enc = self.relative_pos_enc[kv_len-q_len:kv_len, :kv_len, ...]  # (Ns, Nt, d)
         r = F.linear(relative_pos_enc, self.pos_proj_weight, self.bias_pos).unsqueeze(0)  # (1, Ns, Nt, d')
 
         qk_attn = torch.bmm(q, k.transpose(-2, -1)) / math.sqrt(self.head_dim)  # (B', Nt, Ns)
@@ -891,27 +896,25 @@ class RMHA(nn.Module):
         out = torch.bmm(soft_attn, v).view(bsz, q_len, self.embed_dim).transpose(0, 1)  # (Nt, B, d)
 
         out = self.out_norm(inp + self.out_proj(out))
-        ff_data = [q, k, v, k_attn[:, -1:]]
+        ff_data = [k, v, k_attn[:, -1:]]
         return out, ff_data
 
     def fast_forward(self, inp, prev_ff_data, key_padding_mask=None):
-        prev_q, prev_k, prev_v, low_k_attn = prev_ff_data
+        prev_k, prev_v, low_k_attn = prev_ff_data
         assert not self.batch_first
         assert inp.shape[0] == 1
         bsz = inp.shape[1]
-        prev_q_len = prev_q.shape[1]
         prev_kv_len = prev_k.shape[1]
 
         new_q = F.linear(inp, self.q_proj_weight, self.bias_q).view(1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B', 1, d)
         new_k = F.linear(inp, self.k_proj_weight, self.bias_k).view(1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B', 1, d)
         new_v = F.linear(inp, self.v_proj_weight, self.bias_v).view(1, bsz * self.num_heads, self.head_dim).transpose(0, 1)  # (B', 1, d)
 
-        q = torch.cat([prev_q, new_q], dim=1)
         k = torch.cat([prev_k, new_k], dim=1)
         v = torch.cat([prev_v, new_v], dim=1)  # (B', prev_kv_len+1, d')
 
         # compute delta r
-        low_r = self.relative_pos_enc[prev_q_len, :prev_kv_len+1]  # (prev_kv_len+1, d)
+        low_r = self.relative_pos_enc[prev_kv_len+1, :prev_kv_len+1]  # (prev_kv_len+1, d)
         low_r = F.linear(low_r, self.pos_proj_weight, self.bias_pos).view(1, 1, prev_kv_len+1, -1)  # (1, 1, prev_kv_len+1, d')
 
         # compute new qk_attn
@@ -940,7 +943,7 @@ class RMHA(nn.Module):
         out = out.view(bsz, 1, self.embed_dim).transpose(0, 1)  # (1, B, d)
         out = self.out_norm(inp + self.out_proj(out))
 
-        ff_data = [q, k, v, low_k_attn]
+        ff_data = [k, v, low_k_attn]
         return out, ff_data
 
 
